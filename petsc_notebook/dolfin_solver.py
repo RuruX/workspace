@@ -19,11 +19,17 @@ J = derivative(F,u)
 
 A = assemble(J)
 b = assemble(-F)
-# Option 1: the default LU solver of DOLFIN
 
-solve(A, u.vector(), b)
+# ----------Option 0: the default solver of DOLFIN--------------
 
-# Option 2: the PETSc Krylov solver of DOLFIN
+solve(J==-F, u)
+#solve(F==0, u)
+
+# ----------Option 1: the default LU solver of DOLFIN--------------
+
+#solve(A, u.vector(), b)
+
+#--------- Option 2: the PETSc Krylov solver of DOLFIN-------------
 
 #solver = PETScKrylovSolver("gmres","jacobi")
 #solver.parameters['absolute_tolerance'] = 1e-9
@@ -39,6 +45,24 @@ solve(A, u.vector(), b)
 
 #arg2v(u.vector()).assemble()
 #arg2v(u.vector()).ghostUpdate()
+
+
+#----------- Option 3: Nonlinear wrapper for linear system ----------
+
+#problem = NonlinearVariationalProblem(F, u, bcs=[], J=J)
+#solver  = NonlinearVariationalSolver(problem)
+#prm = solver.parameters
+#prm['newton_solver']['relative_tolerance'] = 1E-3
+#prm['newton_solver']['linear_solver'] = 'mumps'
+
+##prm['newton_solver']['linear_solver'] = 'gmres'
+##prm['newton_solver']['preconditioner'] = 'hypre_parasails'
+
+#prm['newton_solver']['krylov_solver']['relative_tolerance'] = 1E-13
+##info(prm, True)
+#set_log_active(False)
+#solver.solve()
+
 
 
 #print('Results:', u.vector().get_local())

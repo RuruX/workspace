@@ -360,10 +360,9 @@ def generate_mortar_mesh(pts=None, num_el=None, data=None,
 
     return mesh
     
-def getNonzeroEntities(M, node):
-    nodes, inds = M.getRowIJ()
-    ind = inds[nodes[node]:nodes[node+1]]
-    return ind
+def getNonzeroEntities(M, row):
+    cols, vals = M.getRow(row)
+    return cols
     
 # helper function to generate an identity permutation IS
 # given an ownership range
@@ -409,7 +408,6 @@ def generatePermutation(V, M, totalDofs):
     MPETSc.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
     MPETSc.setUp()
 
-    offset = 0
     x_nodes = V.tabulate_dof_coordinates()\
                     .reshape((-1,mesh.geometry().dim()))
 
@@ -417,37 +415,31 @@ def generatePermutation(V, M, totalDofs):
     for I in np.arange(0,len(dofs)):
         x = x_nodes[dofs[I]-Istart]
         matRow = dofs[I]
-        print('matRow',matRow)
         nodesAndEvals = getNonzeroEntities(M, matRow)
-#        nodesAndEvals = self.getNodesAndEvals(x,field)
-
-        cols = np.array(nodesAndEvals,dtype='int32')[:] + offset
+        cols = np.array(nodesAndEvals,dtype='int32')[:]
         rows = np.array([matRow,],dtype='int32')
         values = np.full((1,len(nodesAndEvals)),rank+1)
         MPETSc.setValues(rows,cols,values,addv=PETSc.InsertMode.INSERT)
         
-#        for i in range(0,len(nodesAndEvals)):
-#            MPETSc[matRow,nodesAndEvals[i]+offset]\
-#                = rank+1 # need to avoid losing zeros...
-
-
     MPETSc.assemblyBegin()
     MPETSc.assemblyEnd()
-#    print(convert_to_dense(MPETSc))
     MT = MPETSc.transpose(PETSc.Mat(comm=worldcomm))
     Istart, Iend = MT.getOwnershipRange()
     nLocal = Iend - Istart
     partitionInts = np.zeros(nLocal,dtype='int32')
     for i in np.arange(Istart,Iend):
+        print(MT.getRow(i))
         rowValues = MT.getRow(i)[0]
         # isolate nonzero entries
         rowValues = np.extract(rowValues>0,rowValues)
         iLocal = i - Istart
+        print(mode(rowValues))
         modeValues = mode(rowValues)[0]
         if(len(modeValues) > 0):
             partitionInts[iLocal] = int(mode(rowValues).mode[0]-0.5)
         else:
             partitionInts[iLocal] = 0 # necessary?
+        print(partitionInts)
     partitionIS = PETSc.IS(comm=worldcomm)
     partitionIS.createGeneral(partitionInts,comm=worldcomm)
 
@@ -482,25 +474,15 @@ def applyPermutation(M, permutation):
     worldcomm = MPI.comm_world
     rank = MPI.rank(worldcomm)
     if(MPI.size(worldcomm) > 1):
-#        print(rank, M.mat().getSizes())
-#        print(rank, permutation.getSizes())
-        permutation = permutation
-        newM = M.mat().permute\
-                 (generateIdentityPermutation\
-                  (M.mat().getOwnershipRange(),worldcomm),\
-                  permutation)
-        M = PETScMatrix(newM)
-
-        # fix list of zero DOFs
-#        self.permutationAO = PETSc.AO(self.comm)
-#        self.permutationAO\
-#            .createBasic(self.permutation,\
-#                         generateIdentityPermutation\
-#                         (self.M.mat().getOwnershipRangeColumn(),self.comm))
-#        zeroDofIS = PETSc.IS(self.comm)
-#        zeroDofIS.createGeneral(array(self.zeroDofs,dtype=INDEX_TYPE))
-#        self.zeroDofs = self.permutationAO.app2petsc\
-#                        (zeroDofIS).getIndices()
+        colPermutation = permutation
+        rowPermutation = generateIdentityPermutation(M.getOwnershipRange(),worldcomm)
+#        print(rowPermutation.isPermutation())
+#        print('rank', rank, 'row', rowPermutation.getIndices())
+#        print('rank', rank, 'col', colPermutation.getIndices())
+#        M.assemblyBegin()
+#        M.assemblyEnd()
+        newM = M.permute(rowPermutation, colPermutation)
+#        M = PETScMatrix(newM)
     return M
         
 

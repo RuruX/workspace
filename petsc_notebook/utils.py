@@ -1,14 +1,19 @@
 """
-The "cable_robot_utils" module
+The "utils" module
 ------------------------------
-contains functions that can be used perform simulation
-of cable driven robot.
+contains backend matrix operations based on PETSc4py
 """
 from dolfin import *
 import os
 import numpy as np
 from petsc4py import PETSc
 from scipy.stats import mode
+from timeit import default_timer
+from mpi4py import MPI as pyMPI
+
+worldcomm = MPI.comm_world
+mpirank = MPI.rank(worldcomm)
+mpisize = MPI.size(worldcomm)
 
 DOLFIN_FUNCTION = function.function.Function
 DOLFIN_VECTOR = cpp.la.Vector
@@ -164,18 +169,10 @@ def AT_x(A, x):
     A_PETSc = arg2m(A)
     x_PETSc = arg2v(x)
     row, col = A_PETSc.getSizes()
-#    print(row, col)
     b_PETSc = zero_petsc_vec(col, comm=A_PETSc.getComm())
     A_PETSc.multTranspose(x_PETSc, b_PETSc)
     return b_PETSc
     
-#    row, col = m2p(A).getSizes()
-#    y = PETSc.Vec().create()
-#    y.setSizes(col)
-#    y.setUp()
-#    m2p(A).multTranspose(v2p(R.vector()),y)
-#    y.assemble()
-#    return y.getArray()
 
 def AT_x_b(A, x, b):
     """
@@ -359,10 +356,112 @@ def generate_mortar_mesh(pts=None, num_el=None, data=None,
         os.remove(MESH_FILE_NAME)
 
     return mesh
+
+
+def solve_linear(A, x, b, solver=None, preconditioner=None, 
+                        rtol=1E-10, atol=1E-9, max_it=2000):
+    """
+    Solve linear system "Ax=b"
     
+    Parameters
+    ------------
+    A: PETSc.Mat
+    x: PETSc.Vec
+    b: PETSc.Vec
+    """
+    
+    if not isinstance(A, PETSC4PY_MATRIX):
+        raise TypeError("Type "+str(type(A))+" is not supported yet.")
+        
+    if solver is None:
+        " Option 1: the default LU solver of DOLFIN "
+        solve(PETScMatrix(A), PETScVector(x), PETScVector(b), 'mumps')
+
+    elif solver == 'PETScKrylovSolver':
+        " Option 2: the PETSc Krylov solver of DOLFIN "
+        
+        A_p = PETScMatrix(A)
+        b_p = PETScVector(b)
+#        list_linear_solver_methods()
+#        list_krylov_solver_preconditioners()
+        solver = PETScKrylovSolver("cg", "jacobi")
+        solver.parameters['absolute_tolerance'] = atol
+        solver.parameters['relative_tolerance'] = rtol
+        solver.parameters['maximum_iterations'] = max_it
+        solver.parameters['monitor_convergence'] = True
+        solver.parameters['nonzero_initial_guess'] = False
+        solver.parameters['error_on_nonconvergence'] = False
+        # A large restart value typically leads to better convergence behavior, 
+        # but also has higher time and memory requirements.
+#        solver.ksp().setGMRESRestart(max_it)
+        solver.set_operators(A_p, A_p)
+        solver.solve(PETScVector(x),b_p)
+    
+    elif solver == 'KSP':
+        " Option 3: Solve with PETSc.KSP solver "
+
+#        PETScOptions.set("ksp_monitor_true_residual")
+        RTOL = rtol
+        ATOL = atol
+        MAXIT = max_it
+        ksp = PETSc.KSP().create(worldcomm) 
+        ksp.setType(PETSc.KSP.Type.GMRES)
+        A.assemblyBegin()
+        A.assemblyEnd()
+        ksp.setOperators(A)
+        ksp.setTolerances(rtol=RTOL, atol=ATOL, max_it=MAXIT)
+        ksp.setFromOptions()
+        
+        if preconditioner is None:
+            pc = ksp.getPC()
+            pc.setType("jacobi")
+            ksp.setUp()
+            ksp.setGMRESRestart(100)
+
+        elif preconditioner == 'ASM':
+            pc = ksp.getPC()
+            pc.setType("asm")
+            pc.setASMOverlap(1)
+            ksp.setUp()
+            localKSP = pc.getASMSubKSP()[0]
+            localKSP.setType(PETSc.KSP.Type.GMRES)
+            localKSP.getPC().setType("lu")
+            ksp.setGMRESRestart(100)
+            
+        else:
+            raise TypeError("Preconditioner "
+                        +preconditioner+" is not supported yet.")
+        ksp.setConvergenceHistory()
+        ksp.solve(b,x)
+        if mpirank == 0:
+            history = ksp.getConvergenceHistory()
+            iteration = ksp.getIterationNumber()
+            print('Converged in', iteration, 'iterations.')
+#            print('Residual norm', history[-1])
+#            print('Convergence history:', history)
+        
+    else:
+        raise TypeError("Solver "+solver+" is not supported yet.")
+    
+        
 def getNonzeroEntities(M, row):
-    cols, vals = M.getRow(row)
+    cols = M.getRow(row)[0]
     return cols
+
+def getPrealloc(M):
+    maxPrealloc = 0
+    Istart, Iend = M.getOwnershipRange()
+    for i in np.arange(Istart,Iend):
+        nz_cols = getNonzeroEntities(M, i)
+        prealloc = len(nz_cols)
+        if(prealloc > maxPrealloc):
+            maxPrealloc = prealloc
+    if mpisize > 1:
+        global_maxPrealloc = worldcomm.allreduce(
+                    sendobj=maxPrealloc, op=pyMPI.MAX)
+    else:
+        global_maxPrealloc = maxPrealloc
+    return global_maxPrealloc
     
 # helper function to generate an identity permutation IS
 # given an ownership range
@@ -384,81 +483,73 @@ def generateIdentityPermutation(ownRange, comm):
 # override default behavior to order unknowns according to what task's
 # FE mesh they overlap.  this will (hopefully) reduce communication
 # cost in the matrix--matrix multiplies
-def generatePermutation(V, M, totalDofs):
-    """V: Foreground Function Space"""
+def generatePermutation(M):
     """
     Generates a permutation of the IGA degrees of freedom that tries to
     ensure overlap of their parallel partitioning with that of the FE
     degrees of freedom, which are partitioned automatically based on the
     FE mesh.
+    
+    Parameters: 
+    -------------
+    V: foreground function space
+    M: extraction matrix (dolfin.cpp.la.PETSc.Matrix)
+    totalDofs: total DOFs of the background function space
+    
     """
-    worldcomm = MPI.comm_world
-    rank = MPI.rank(worldcomm)
-    mesh = V.mesh()
-    func = Function(V)
-    Istart, Iend = as_backend_type(func.vector()).vec().getOwnershipRange()
+    Istart, Iend = M.getOwnershipRange()
     nLocalNodes = Iend - Istart
+    totalDofs = M.getSizes()[1][1]
+    prealloc = getPrealloc(M)
+    
+    J = PETSc.Mat(comm=worldcomm)
+    J.createAIJ([[nLocalNodes,None],[None,totalDofs]],comm=worldcomm)
+    J.setPreallocationNNZ([prealloc,prealloc])
+    J.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, True)
+    J.setUp()
 
-    totalDofs = totalDofs
-    DEFAULT_PREALLOC = 500
-    MPETSc = PETSc.Mat(comm=worldcomm)
-    MPETSc.createAIJ([[nLocalNodes,None],[None,totalDofs]],comm=worldcomm)
-    MPETSc.setPreallocationNNZ([DEFAULT_PREALLOC,
-                                DEFAULT_PREALLOC])
-    MPETSc.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
-    MPETSc.setUp()
-
-    x_nodes = V.tabulate_dof_coordinates()\
-                    .reshape((-1,mesh.geometry().dim()))
-
-    dofs = V.dofmap().dofs()
-    for I in np.arange(0,len(dofs)):
-        x = x_nodes[dofs[I]-Istart]
-        matRow = dofs[I]
+    for matRow in np.arange(Istart,Iend):
         nodesAndEvals = getNonzeroEntities(M, matRow)
-        cols = np.array(nodesAndEvals,dtype='int32')[:]
-        rows = np.array([matRow,],dtype='int32')
-        values = np.full((1,len(nodesAndEvals)),rank+1)
-        MPETSc.setValues(rows,cols,values,addv=PETSc.InsertMode.INSERT)
-        
-    MPETSc.assemblyBegin()
-    MPETSc.assemblyEnd()
-    MT = MPETSc.transpose(PETSc.Mat(comm=worldcomm))
-    Istart, Iend = MT.getOwnershipRange()
+        for i in range(0,len(nodesAndEvals)):
+            J[matRow,nodesAndEvals[i]]= mpirank+1 # need to avoid losing zeros...
+            
+    
+    J.assemblyBegin()
+    J.assemblyEnd()
+    JT = J.transpose(PETSc.Mat(comm=worldcomm))
+    Istart, Iend = JT.getOwnershipRange()
     nLocal = Iend - Istart
     partitionInts = np.zeros(nLocal,dtype='int32')
+    
     for i in np.arange(Istart,Iend):
-        print(MT.getRow(i))
-        rowValues = MT.getRow(i)[0]
+        rowValues = JT.getRow(i)[0]
         # isolate nonzero entries
         rowValues = np.extract(rowValues>0,rowValues)
         iLocal = i - Istart
-        print(mode(rowValues))
+        # the modal (most common) value; or the minnimum value 
         modeValues = mode(rowValues)[0]
         if(len(modeValues) > 0):
             partitionInts[iLocal] = int(mode(rowValues).mode[0]-0.5)
         else:
             partitionInts[iLocal] = 0 # necessary?
-        print(partitionInts)
     partitionIS = PETSc.IS(comm=worldcomm)
     partitionIS.createGeneral(partitionInts,comm=worldcomm)
-
     # kludgy, non-scalable solution:
-    
     # all-gather the partition indices and apply argsort to their
     # underlying arrays
     bigIndices = np.argsort(partitionIS.allGather().getIndices())\
                  .astype('int32')
-
     # note: index set sort method only sorts locally on each processor
 
     # note: output of argsort is what we want for MatPermute(); it
     # maps from indices in the sorted array, to indices in the original
     # unsorted array.
-    
     # use slices [Istart:Iend] of the result from argsort to create
     # a new IS that can be used as a petsc ordering
     retval = PETSc.IS(comm=worldcomm)
+    # FIXED: the column ownership of M does not automatically coincide with the 
+    # row ownership of JT. 
+    Istart, Iend = M.getOwnershipRangeColumn()
     retval.createGeneral(bigIndices[Istart:Iend],comm=worldcomm)
     
     return retval
@@ -471,18 +562,14 @@ def applyPermutation(M, permutation):
     of freedom, which is generated by standard mesh-partitioning
     approaches in FEniCS.
     """
-    worldcomm = MPI.comm_world
-    rank = MPI.rank(worldcomm)
     if(MPI.size(worldcomm) > 1):
         colPermutation = permutation
-        rowPermutation = generateIdentityPermutation(M.getOwnershipRange(),worldcomm)
-#        print(rowPermutation.isPermutation())
-#        print('rank', rank, 'row', rowPermutation.getIndices())
-#        print('rank', rank, 'col', colPermutation.getIndices())
-#        M.assemblyBegin()
-#        M.assemblyEnd()
+        rowPermutation = generateIdentityPermutation(
+                                M.getOwnershipRange(),worldcomm)
+        rowInd = rowPermutation.getIndices()
+        colInd = colPermutation.getIndices()
+        
         newM = M.permute(rowPermutation, colPermutation)
-#        M = PETScMatrix(newM)
     return M
         
 

@@ -3,6 +3,11 @@ from petsc4py import *
 import numpy as np
 from utils import *
 
+
+worldcomm = MPI.comm_world
+rank = MPI.rank(worldcomm)
+
+
 def solveKSP(A,b,u,method=None):
     """
     solve linear system A*u=b
@@ -12,7 +17,8 @@ def solveKSP(A,b,u,method=None):
         ksp.setType(PETSc.KSP.Type.GMRES)
         A.assemble()
         ksp.setOperators(A)
-        ksp.setUp()
+        ksp.setTolerances(rtol=1E-10, atol=1E-8, max_it=10000)
+        ksp.setFromOptions()   
 
     elif method == 'ASM':
         ksp = PETSc.KSP().create() 
@@ -36,8 +42,7 @@ def solveKSP(A,b,u,method=None):
     print('Convergence history:', history)
 
 
-worldcomm = MPI.comm_world
-rank = MPI.rank(worldcomm)
+
 mesh = UnitSquareMesh(4,4)
 V = FunctionSpace(mesh, 'CG', 1)
 u = Function(V)
@@ -53,8 +58,6 @@ u_p = PETSc.Vec().create()
 u_p = as_backend_type(u.vector()).vec()
 u_p.setUp()
 
-#list_linear_solver_methods()
-#list_krylov_solver_preconditioners()
 solveKSP(A, b, u_p)
 
 
